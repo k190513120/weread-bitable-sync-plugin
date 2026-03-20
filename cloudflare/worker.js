@@ -3,7 +3,7 @@ const WEREAD_NOTEBOOKS_URL = 'https://weread.qq.com/api/user/notebook';
 const WEREAD_BOOKMARK_LIST_URL = 'https://weread.qq.com/web/book/bookmarklist';
 const WEREAD_REVIEW_LIST_URL = 'https://weread.qq.com/web/review/list';
 const WEREAD_CHAPTER_INFOS_URL = 'https://weread.qq.com/web/book/chapterInfos';
-const FREE_RECORD_QUOTA = 10;
+const FREE_BOOK_QUOTA = 3;
 const YEAR_SECONDS = 365 * 24 * 60 * 60;
 
 function asArray(value) {
@@ -156,9 +156,9 @@ async function resolveStripePrice(env, productName) {
   return { priceId: String(matchedPrice.id), mode };
 }
 
-async function putStripeState(env, key, value) {
+async function putStripeState(env, key, value, ttl) {
   if (!env.STRIPE_STATE) return;
-  await env.STRIPE_STATE.put(key, JSON.stringify(value), { expirationTtl: 60 * 60 * 24 * 90 });
+  await env.STRIPE_STATE.put(key, JSON.stringify(value), { expirationTtl: ttl || 60 * 60 * 24 * 90 });
 }
 
 async function getStripeState(env, key) {
@@ -197,50 +197,52 @@ async function getEntitlementByUserId(env, userId) {
 
 async function getUsageByEmail(env, email) {
   const normalizedEmail = normalizeEmail(email);
-  if (!normalizedEmail) return { usedRecords: 0, email: normalizedEmail };
+  if (!normalizedEmail) return { usedBooks: 0, email: normalizedEmail };
   const usage = await getStripeState(env, `stripe:usage:email:${normalizedEmail}`);
-  if (!usage) return { usedRecords: 0, email: normalizedEmail };
+  if (!usage) return { usedBooks: 0, email: normalizedEmail };
   return {
-    usedRecords: normalizeInt(usage.usedRecords, 0, 0, 1000000),
+    usedBooks: normalizeInt(usage.usedBooks ?? usage.usedRecords, 0, 0, 1000000),
     email: normalizedEmail
   };
 }
 
 async function getUsageByUserId(env, userId) {
   const normalizedUserId = normalizeUserId(userId);
-  if (!normalizedUserId) return { usedRecords: 0, userId: normalizedUserId };
+  if (!normalizedUserId) return { usedBooks: 0, userId: normalizedUserId };
   const usage = await getStripeState(env, `stripe:usage:user:${normalizedUserId}`);
-  if (!usage) return { usedRecords: 0, userId: normalizedUserId };
+  if (!usage) return { usedBooks: 0, userId: normalizedUserId };
   return {
-    usedRecords: normalizeInt(usage.usedRecords, 0, 0, 1000000),
+    usedBooks: normalizeInt(usage.usedBooks ?? usage.usedRecords, 0, 0, 1000000),
     userId: normalizedUserId
   };
 }
 
-async function setUsageByEmail(env, email, usedRecords) {
+async function setUsageByEmail(env, email, usedBooks) {
   const normalizedEmail = normalizeEmail(email);
   if (!normalizedEmail) return;
   await putStripeState(env, `stripe:usage:email:${normalizedEmail}`, {
     email: normalizedEmail,
-    usedRecords: Math.max(0, Number(usedRecords) || 0),
+    usedBooks: Math.max(0, Number(usedBooks) || 0),
     updatedAt: Date.now()
   });
 }
 
-async function setUsageByUserId(env, userId, usedRecords) {
+async function setUsageByUserId(env, userId, usedBooks) {
   const normalizedUserId = normalizeUserId(userId);
   if (!normalizedUserId) return;
   await putStripeState(env, `stripe:usage:user:${normalizedUserId}`, {
     userId: normalizedUserId,
-    usedRecords: Math.max(0, Number(usedRecords) || 0),
+    usedBooks: Math.max(0, Number(usedBooks) || 0),
     updatedAt: Date.now()
   });
 }
 
 function timingSafeEqual(a, b) {
-  if (a.length !== b.length) return false;
-  let out = 0;
-  for (let i = 0; i < a.length; i += 1) out |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  const len = Math.max(a.length, b.length);
+  let out = a.length ^ b.length;
+  for (let i = 0; i < len; i += 1) {
+    out |= (a.charCodeAt(i) || 0) ^ (b.charCodeAt(i) || 0);
+  }
   return out === 0;
 }
 
@@ -410,7 +412,14 @@ async function handleStripeWebhook(req, env) {
   try {
     const type = String(event?.type || '');
     const object = event?.data?.object || {};
+    const expectedProduct = getStripeProductName(env);
+
     if (type === 'checkout.session.completed') {
+      // Only process events belonging to this product
+      const eventProduct = String(object?.metadata?.product_name || '').trim();
+      if (eventProduct && eventProduct !== expectedProduct) {
+        return jsonResponse(req, env, 200, { received: true, skipped: true, reason: 'product_mismatch' });
+      }
       const email = String(object?.customer_details?.email || object?.customer_email || object?.metadata?.customer_email || '').trim();
       const userId = String(object?.metadata?.user_id || '').trim();
       const customerId = String(object?.customer || '').trim();
@@ -427,10 +436,13 @@ async function handleStripeWebhook(req, env) {
     }
     if (type === 'customer.subscription.updated' || type === 'customer.subscription.created') {
       const customerId = String(object?.customer || '').trim();
-      const status = String(object?.status || '');
       const customerState = customerId ? await getStripeState(env, `stripe:customer:${customerId}`) : null;
-      const email = String(customerState?.email || '').trim();
-      const userId = String(customerState?.userId || '').trim();
+      if (!customerState) {
+        return jsonResponse(req, env, 200, { received: true, skipped: true, reason: 'unknown_customer' });
+      }
+      const status = String(object?.status || '');
+      const email = String(customerState.email || '').trim();
+      const userId = String(customerState.userId || '').trim();
       const periodEnd = Number(object?.current_period_end || 0);
       const expiresAt = periodEnd > 0 ? periodEnd * 1000 : Date.now() + YEAR_SECONDS * 1000;
       if (status === 'active' || status === 'trialing') {
@@ -442,8 +454,11 @@ async function handleStripeWebhook(req, env) {
     if (type === 'customer.subscription.deleted') {
       const customerId = String(object?.customer || '').trim();
       const customerState = customerId ? await getStripeState(env, `stripe:customer:${customerId}`) : null;
-      const email = String(customerState?.email || '').trim();
-      const userId = String(customerState?.userId || '').trim();
+      if (!customerState) {
+        return jsonResponse(req, env, 200, { received: true, skipped: true, reason: 'unknown_customer' });
+      }
+      const email = String(customerState.email || '').trim();
+      const userId = String(customerState.userId || '').trim();
       await markEntitlementInactive(env, { email, userId }, type);
     }
   } catch (error) {
@@ -451,6 +466,212 @@ async function handleStripeWebhook(req, env) {
   }
 
   return jsonResponse(req, env, 200, { received: true });
+}
+
+// ===== Alipay Payment =====
+
+const ALIPAY_GATEWAY = 'https://openapi.alipay.com/gateway.do';
+
+function cleanBase64Key(raw) {
+  return raw.replace(/-----[A-Z\s]+-----/g, '').replace(/[\s\r\n]/g, '');
+}
+
+function base64ToUint8Array(base64) {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes;
+}
+
+async function rsaSign(content, privateKeyBase64) {
+  const cleanKey = cleanBase64Key(privateKeyBase64);
+  const binaryDer = base64ToUint8Array(cleanKey);
+  const key = await crypto.subtle.importKey(
+    'pkcs8',
+    binaryDer,
+    { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
+    false,
+    ['sign']
+  );
+  const signature = await crypto.subtle.sign(
+    'RSASSA-PKCS1-v1_5',
+    key,
+    new TextEncoder().encode(content)
+  );
+  const bytes = new Uint8Array(signature);
+  let binary = '';
+  for (let i = 0; i < bytes.length; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary);
+}
+
+async function rsaVerify(content, signatureBase64, publicKeyBase64) {
+  const cleanKey = cleanBase64Key(publicKeyBase64);
+  const binaryDer = base64ToUint8Array(cleanKey);
+  const key = await crypto.subtle.importKey(
+    'spki',
+    binaryDer,
+    { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
+    false,
+    ['verify']
+  );
+  const sigBytes = base64ToUint8Array(signatureBase64);
+  return crypto.subtle.verify(
+    'RSASSA-PKCS1-v1_5',
+    key,
+    sigBytes,
+    new TextEncoder().encode(content)
+  );
+}
+
+function formatAlipayTimestamp() {
+  const d = new Date(Date.now() + 8 * 3600 * 1000);
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`;
+}
+
+function buildAlipaySignString(params) {
+  return Object.keys(params)
+    .filter(k => params[k] !== undefined && params[k] !== '' && params[k] !== null)
+    .sort()
+    .map(k => `${k}=${params[k]}`)
+    .join('&');
+}
+
+async function alipayRequest(env, method, bizContent, extraParams = {}) {
+  const appId = String(env.ALIPAY_APP_ID || '').trim();
+  const privateKey = String(env.ALIPAY_APP_PRIVATE_KEY || '').trim();
+  if (!appId || !privateKey) {
+    throw new Error('未配置支付宝应用参数 (ALIPAY_APP_ID / ALIPAY_APP_PRIVATE_KEY)');
+  }
+  const params = {
+    app_id: appId,
+    method,
+    charset: 'utf-8',
+    sign_type: 'RSA2',
+    timestamp: formatAlipayTimestamp(),
+    version: '1.0',
+    biz_content: JSON.stringify(bizContent),
+    ...extraParams
+  };
+  const signString = buildAlipaySignString(params);
+  params.sign = await rsaSign(signString, privateKey);
+  const response = await fetch(ALIPAY_GATEWAY, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=utf-8' },
+    body: new URLSearchParams(params).toString()
+  });
+  const result = await response.json();
+  const responseKey = method.replace(/\./g, '_') + '_response';
+  const data = result[responseKey];
+  if (!data || data.code !== '10000') {
+    throw new Error(data?.sub_msg || data?.msg || `支付宝接口失败: ${method}`);
+  }
+  return data;
+}
+
+function generateOutTradeNo() {
+  const ts = Date.now().toString(36);
+  const rand = Math.random().toString(36).slice(2, 8);
+  return `WR${ts}${rand}`;
+}
+
+async function createAlipayPrecreateOrder(env, userId, req) {
+  const amount = String(env.ALIPAY_AMOUNT || '9.80').trim();
+  const subject = String(env.ALIPAY_SUBJECT || '微信读书同步多维表格').trim();
+  const outTradeNo = generateOutTradeNo();
+  const requestUrl = new URL(req.url);
+  const baseUrl = String(env.ALIPAY_NOTIFY_BASE_URL || env.APP_BASE_URL || `${requestUrl.protocol}//${requestUrl.host}`).trim();
+  const notifyUrl = `${baseUrl}/api/alipay/notify`;
+  const result = await alipayRequest(env, 'alipay.trade.precreate', {
+    out_trade_no: outTradeNo,
+    total_amount: amount,
+    subject
+  }, { notify_url: notifyUrl });
+  await putStripeState(env, `pay:trade:${outTradeNo}`, {
+    userId,
+    amount,
+    subject,
+    status: 'WAIT_BUYER_PAY',
+    qrCode: result.qr_code,
+    createdAt: Date.now()
+  }, 60 * 60 * 24);
+  return { outTradeNo, qrCode: result.qr_code };
+}
+
+async function handleAlipayTradeQuery(req, env) {
+  const url = new URL(req.url);
+  const outTradeNo = String(url.searchParams.get('outTradeNo') || '').trim();
+  if (!outTradeNo) {
+    return jsonResponse(req, env, 400, { status: 'failed', message: '缺少 outTradeNo' });
+  }
+  const tradeInfo = await getStripeState(env, `pay:trade:${outTradeNo}`);
+  if (!tradeInfo) {
+    return jsonResponse(req, env, 404, { status: 'failed', message: '订单不存在或已过期' });
+  }
+  if (tradeInfo.status === 'TRADE_SUCCESS') {
+    return jsonResponse(req, env, 200, { status: 'ok', tradeStatus: 'TRADE_SUCCESS', paid: true });
+  }
+  if (tradeInfo.userId) {
+    const entitlement = await getEntitlementByUserId(env, tradeInfo.userId);
+    if (resolveEntitlementActive(entitlement)) {
+      return jsonResponse(req, env, 200, { status: 'ok', tradeStatus: 'TRADE_SUCCESS', paid: true });
+    }
+  }
+  try {
+    const result = await alipayRequest(env, 'alipay.trade.query', { out_trade_no: outTradeNo });
+    const tradeStatus = String(result.trade_status || '');
+    if (tradeStatus === 'TRADE_SUCCESS' || tradeStatus === 'TRADE_FINISHED') {
+      const expiresAt = Date.now() + YEAR_SECONDS * 1000;
+      await markEntitlementActive(env, { userId: tradeInfo.userId }, 'alipay_trade', expiresAt);
+      tradeInfo.status = 'TRADE_SUCCESS';
+      await putStripeState(env, `pay:trade:${outTradeNo}`, tradeInfo, 60 * 60 * 24);
+      return jsonResponse(req, env, 200, { status: 'ok', tradeStatus: 'TRADE_SUCCESS', paid: true });
+    }
+    return jsonResponse(req, env, 200, { status: 'ok', tradeStatus, paid: false });
+  } catch (error) {
+    return jsonResponse(req, env, 200, { status: 'ok', tradeStatus: 'WAIT_BUYER_PAY', paid: false });
+  }
+}
+
+async function handleAlipayNotify(req, env) {
+  const rawBody = await req.text();
+  const params = Object.fromEntries(new URLSearchParams(rawBody));
+  const sign = params.sign || '';
+  const signType = params.sign_type || 'RSA2';
+  if (signType !== 'RSA2') {
+    return new Response('failure', { status: 200, headers: { 'Content-Type': 'text/plain' } });
+  }
+  const verifyParams = { ...params };
+  delete verifyParams.sign;
+  delete verifyParams.sign_type;
+  const signString = buildAlipaySignString(verifyParams);
+  const publicKey = String(env.ALIPAY_PUBLIC_KEY || '').trim();
+  if (!publicKey) {
+    return new Response('failure', { status: 200, headers: { 'Content-Type': 'text/plain' } });
+  }
+  let verified = false;
+  try {
+    verified = await rsaVerify(signString, sign, publicKey);
+  } catch (_) {}
+  if (!verified) {
+    return new Response('failure', { status: 200, headers: { 'Content-Type': 'text/plain' } });
+  }
+  const tradeStatus = params.trade_status || '';
+  const outTradeNo = params.out_trade_no || '';
+  if (tradeStatus === 'TRADE_SUCCESS' || tradeStatus === 'TRADE_FINISHED') {
+    const tradeInfo = await getStripeState(env, `pay:trade:${outTradeNo}`);
+    if (tradeInfo && tradeInfo.userId) {
+      const expiresAt = Date.now() + YEAR_SECONDS * 1000;
+      await markEntitlementActive(env, { userId: tradeInfo.userId }, 'alipay_notify', expiresAt);
+      tradeInfo.status = 'TRADE_SUCCESS';
+      await putStripeState(env, `pay:trade:${outTradeNo}`, tradeInfo, 60 * 60 * 24);
+    }
+  }
+  return new Response('success', { status: 200, headers: { 'Content-Type': 'text/plain' } });
 }
 
 async function handleGetEntitlement(req, env) {
@@ -467,16 +688,17 @@ async function handleGetEntitlement(req, env) {
     ? await getUsageByUserId(env, userId)
     : await getUsageByEmail(env, email);
   const active = resolveEntitlementActive(entitlement);
-  const remainingFreeRecords = Math.max(0, FREE_RECORD_QUOTA - usage.usedRecords);
+  const remainingFreeBooks = Math.max(0, FREE_BOOK_QUOTA - usage.usedBooks);
   return jsonResponse(req, env, 200, {
     status: 'ok',
     entitlement: entitlement
       ? { ...entitlement, active }
       : { active: false, userId: userId || '', email: email || '', expiresAt: 0 },
     freeQuota: {
-      total: FREE_RECORD_QUOTA,
-      used: usage.usedRecords,
-      remaining: remainingFreeRecords
+      unit: 'books',
+      total: FREE_BOOK_QUOTA,
+      used: usage.usedBooks,
+      remaining: remainingFreeBooks
     }
   });
 }
@@ -491,11 +713,11 @@ async function checkSyncPermission(body, env) {
     return { ok: true, userId, paid: true };
   }
   const usage = await getUsageByUserId(env, userId);
-  const remaining = Math.max(0, FREE_RECORD_QUOTA - usage.usedRecords);
+  const remaining = Math.max(0, FREE_BOOK_QUOTA - usage.usedBooks);
   if (remaining <= 0) {
-    return { ok: false, userId, paymentRequired: true, message: '免费 10 条额度已用完，请先完成支付' };
+    return { ok: false, userId, paymentRequired: true, message: '免费 3 本书额度已用完，请先完成支付' };
   }
-  return { ok: true, userId, paid: false, remainingFreeRecords: remaining, usedRecords: usage.usedRecords };
+  return { ok: true, userId, paid: false, remainingFreeBooks: remaining, usedBooks: usage.usedBooks };
 }
 
 async function fetchJson(url, init) {
@@ -595,32 +817,93 @@ async function fetchChapterMap(bookId, wereadCookie) {
 }
 
 async function fetchBookmarks(bookId, wereadCookie) {
-  const url = `${WEREAD_BOOKMARK_LIST_URL}?bookId=${encodeURIComponent(bookId)}`;
-  const payload = await wereadRequestJson(url, { method: 'GET' }, wereadCookie);
-  return asArray(payload?.updated);
+  const pageSize = 100;
+  const maxPages = 20;
+  const records = [];
+  const seen = new Set();
+  let maxIdx = '0';
+  let syncKey = '0';
+
+  for (let page = 0; page < maxPages; page += 1) {
+    const params = new URLSearchParams({
+      bookId: String(bookId),
+      maxIdx,
+      count: String(pageSize),
+      syncKey
+    });
+    const payload = await wereadRequestJson(`${WEREAD_BOOKMARK_LIST_URL}?${params.toString()}`, { method: 'GET' }, wereadCookie);
+    const list = asArray(payload?.updated);
+    if (!list.length) break;
+
+    for (const item of list) {
+      const dedupeKey = String(item?.bookmarkId || item?.markId || `${item?.chapterUid || ''}-${item?.markTime || ''}`);
+      if (dedupeKey && seen.has(dedupeKey)) continue;
+      if (dedupeKey) seen.add(dedupeKey);
+      records.push(item);
+    }
+
+    const nextMaxIdx = String(payload?.nextMaxIdx ?? payload?.maxIdx ?? '');
+    const nextSyncKey = String(payload?.syncKey ?? payload?.synckey ?? '');
+    const hasMore = payload?.hasMore === true || payload?.continueFlag === 1 || payload?.isFinished === 0;
+    const cursorChanged = (nextMaxIdx && nextMaxIdx !== maxIdx) || (nextSyncKey && nextSyncKey !== syncKey);
+    if (!hasMore && !cursorChanged) break;
+    if (!cursorChanged && list.length < pageSize) break;
+    if (nextMaxIdx) maxIdx = nextMaxIdx;
+    if (nextSyncKey) syncKey = nextSyncKey;
+  }
+
+  return records;
 }
 
 async function fetchReviews(bookId, wereadCookie) {
-  const params = new URLSearchParams({
-    bookId: String(bookId),
-    listType: '4',
-    maxIdx: '0',
-    count: '50',
-    listMode: '2',
-    syncKey: '0'
-  });
-  const payload = await wereadRequestJson(`${WEREAD_REVIEW_LIST_URL}?${params.toString()}`, { method: 'GET' }, wereadCookie);
-  return asArray(payload?.reviews)
-    .map((item) => item?.review || item || null)
-    .filter(Boolean)
+  const pageSize = 100;
+  const maxPages = 20;
+  const reviews = [];
+  const seen = new Set();
+  let maxIdx = '0';
+  let syncKey = '0';
+
+  for (let page = 0; page < maxPages; page += 1) {
+    const params = new URLSearchParams({
+      bookId: String(bookId),
+      listType: '4',
+      maxIdx,
+      count: String(pageSize),
+      listMode: '2',
+      syncKey
+    });
+    const payload = await wereadRequestJson(`${WEREAD_REVIEW_LIST_URL}?${params.toString()}`, { method: 'GET' }, wereadCookie);
+    const list = asArray(payload?.reviews);
+    if (!list.length) break;
+
+    for (const item of list) {
+      const review = item?.review || item || null;
+      if (!review) continue;
+      const dedupeKey = String(review?.reviewId || review?.bookmarkId || '');
+      if (dedupeKey && seen.has(dedupeKey)) continue;
+      if (dedupeKey) seen.add(dedupeKey);
+      reviews.push(review);
+    }
+
+    const nextMaxIdx = String(payload?.nextMaxIdx ?? payload?.maxIdx ?? '');
+    const nextSyncKey = String(payload?.syncKey ?? payload?.synckey ?? '');
+    const hasMore = payload?.hasMore === true || payload?.continueFlag === 1 || payload?.isFinished === 0;
+    const cursorChanged = (nextMaxIdx && nextMaxIdx !== maxIdx) || (nextSyncKey && nextSyncKey !== syncKey);
+    if (!hasMore && !cursorChanged) break;
+    if (!cursorChanged && list.length < pageSize) break;
+    if (nextMaxIdx) maxIdx = nextMaxIdx;
+    if (nextSyncKey) syncKey = nextSyncKey;
+  }
+
+  return reviews
     .map((review) => ({
-      markText: String(review?.content || review?.abstract || ''),
-      abstract: String(review?.abstract || ''),
+      markText: String(review?.abstract || ''),
+      noteText: String(review?.content || ''),
       reviewId: String(review?.reviewId || ''),
       createTime: review?.createTime,
       chapterUid: Number(review?.type) === 4 ? 1000000 : review?.chapterUid
     }))
-    .filter((x) => x.markText);
+    .filter((x) => x.markText || x.noteText);
 }
 
 async function fetchNotebooks(wereadCookie, maxBooksLimit) {
@@ -630,9 +913,10 @@ async function fetchNotebooks(wereadCookie, maxBooksLimit) {
 }
 
 async function fetchHighlightsByWereadCookie(wereadCookie, maxRecords, maxBooksLimit) {
-  if (!wereadCookie) return [];
+  if (!wereadCookie) return { highlights: [], books: [] };
   const books = await fetchNotebooks(wereadCookie, maxBooksLimit);
   const highlights = [];
+  const booksMeta = [];
   for (const item of books) {
     if (highlights.length >= maxRecords) break;
     const book = item?.book || {};
@@ -642,6 +926,7 @@ async function fetchHighlightsByWereadCookie(wereadCookie, maxRecords, maxBooksL
     const bookTitle = String(book?.title || '');
     const author = String(book?.author || '');
     const tags = asArray(book?.categories).map((x) => String(x?.title || '')).filter(Boolean).join('、');
+    booksMeta.push(item);
 
     let chapterMap = {};
     try {
@@ -653,16 +938,16 @@ async function fetchHighlightsByWereadCookie(wereadCookie, maxRecords, maxBooksL
     try {
       const bookmarks = await fetchBookmarks(bookId, wereadCookie);
       const reviews = await fetchReviews(bookId, wereadCookie);
-      for (const row of [...bookmarks, ...reviews]) {
+      for (const row of bookmarks) {
         const chapter = chapterMap[String(row?.chapterUid)] || '';
         const mapped = normalizeHighlight({
           bookTitle,
           author,
           chapter,
           highlightText: row?.markText || row?.text || row?.highlightText,
-          noteText: row?.abstract || '',
+          noteText: '',
           tags,
-          highlightId: row?.reviewId || row?.bookmarkId || row?.markId || '',
+          highlightId: row?.bookmarkId || row?.markId || '',
           bookId,
           highlightedAt: row?.createTime || row?.markTime,
           updatedAt: row?.updateTime || row?.createTime
@@ -670,9 +955,29 @@ async function fetchHighlightsByWereadCookie(wereadCookie, maxRecords, maxBooksL
         if (mapped) highlights.push(mapped);
         if (highlights.length >= maxRecords) break;
       }
+      for (const row of reviews) {
+        const chapter = chapterMap[String(row?.chapterUid)] || '';
+        const mapped = normalizeHighlight({
+          bookTitle,
+          author,
+          chapter,
+          highlightText: row?.markText || '',
+          noteText: row?.noteText || '',
+          tags,
+          highlightId: row?.reviewId || '',
+          bookId,
+          highlightedAt: row?.createTime,
+          updatedAt: row?.createTime
+        });
+        if (mapped) highlights.push(mapped);
+        if (highlights.length >= maxRecords) break;
+      }
     } catch (_) {}
   }
-  return highlights.slice(0, maxRecords);
+  return {
+    highlights: highlights.slice(0, maxRecords),
+    books: booksMeta
+  };
 }
 
 async function resolveCookie(body, env) {
@@ -690,6 +995,20 @@ async function handleSync(req, env) {
   const permission = await checkSyncPermission(body, env);
   if (!permission.ok) {
     if (permission.paymentRequired) {
+      const paymentMethod = String(body?.paymentMethod || 'stripe').trim();
+      if (paymentMethod === 'alipay') {
+        try {
+          const order = await createAlipayPrecreateOrder(env, permission.userId, req);
+          return jsonResponse(req, env, 200, {
+            status: 'payment_required',
+            message: permission.message,
+            qrCode: order.qrCode,
+            outTradeNo: order.outTradeNo
+          });
+        } catch (error) {
+          return jsonResponse(req, env, 500, { status: 'failed', message: `创建支付宝订单失败：${error?.message || 'unknown error'}` });
+        }
+      }
       try {
         const checkoutUrl = await createCheckoutSessionUrl(
           env,
@@ -709,28 +1028,54 @@ async function handleSync(req, env) {
     return jsonResponse(req, env, 400, { status: 'failed', message: permission.message });
   }
   const maxBooks = normalizeInt(body?.maxBooks, normalizeInt(env.WEREAD_MAX_SYNC_BOOKS, 2000));
-  let maxRecords = normalizeInt(body?.maxRecords, normalizeInt(env.WEREAD_MAX_SYNC_RECORDS, 200));
+  let maxRecords = normalizeInt(body?.maxRecords, normalizeInt(env.WEREAD_MAX_SYNC_RECORDS, 200000, 1, 500000), 1, 500000);
+  let effectiveMaxBooks = maxBooks;
   if (!permission.paid) {
-    maxRecords = Math.max(1, Math.min(maxRecords, permission.remainingFreeRecords));
+    effectiveMaxBooks = Math.max(1, Math.min(maxBooks, permission.remainingFreeBooks));
+    maxRecords = normalizeInt(env.WEREAD_FREE_MAX_RECORDS, 200000, 1, 500000);
+    // 预扣配额，防止并发请求绕过免费限制
+    const preAllocated = (permission.usedBooks || 0) + effectiveMaxBooks;
+    await setUsageByUserId(env, permission.userId, preAllocated);
   }
   const strictRealData = String(env.WEREAD_STRICT_REAL_DATA || 'true') === 'true';
   const wereadCookie = await resolveCookie(body, env);
 
   if (!wereadCookie) {
+    // 回退预扣配额
+    if (!permission.paid) {
+      await setUsageByUserId(env, permission.userId, permission.usedBooks || 0);
+    }
     return jsonResponse(req, env, 400, { status: 'failed', message: '缺少可用 Cookie，请传 wereadCookie 或配置 CookieCloud/WEREAD_COOKIE' });
   }
 
   try {
-    const highlights = await fetchHighlightsByWereadCookie(wereadCookie, maxRecords, maxBooks);
+    const syncPayload = await fetchHighlightsByWereadCookie(wereadCookie, maxRecords, effectiveMaxBooks);
+    const highlights = asArray(syncPayload?.highlights);
+    const books = asArray(syncPayload?.books);
     if (!highlights.length && strictRealData) {
+      // 回退预扣配额
+      if (!permission.paid) {
+        await setUsageByUserId(env, permission.userId, permission.usedBooks || 0);
+      }
       return jsonResponse(req, env, 500, { status: 'failed', message: '真实数据抓取结果为空，请检查 Cookie 是否有效' });
     }
     if (!permission.paid) {
-      const usedRecords = (permission.usedRecords || 0) + highlights.length;
-      await setUsageByUserId(env, permission.userId, usedRecords);
+      // 用实际消耗量修正预扣配额
+      const actualUsed = (permission.usedBooks || 0) + books.length;
+      await setUsageByUserId(env, permission.userId, actualUsed);
+      const remainingFreeBooks = Math.max(0, FREE_BOOK_QUOTA - actualUsed);
+      return jsonResponse(req, env, 200, {
+        status: 'completed', highlights, books,
+        paid: false,
+        freeQuota: { total: FREE_BOOK_QUOTA, used: actualUsed, remaining: remainingFreeBooks }
+      });
     }
-    return jsonResponse(req, env, 200, { status: 'completed', highlights });
+    return jsonResponse(req, env, 200, { status: 'completed', highlights, books, paid: true });
   } catch (error) {
+    // 回退预扣配额
+    if (!permission.paid) {
+      await setUsageByUserId(env, permission.userId, permission.usedBooks || 0);
+    }
     return jsonResponse(req, env, 500, { status: 'failed', message: `真实数据抓取失败：${error?.message || 'unknown error'}` });
   }
 }
@@ -755,6 +1100,12 @@ export default {
     }
     if (req.method === 'GET' && pathname === '/api/stripe/entitlement') {
       return handleGetEntitlement(req, env);
+    }
+    if (req.method === 'GET' && pathname === '/api/alipay/trade/query') {
+      return handleAlipayTradeQuery(req, env);
+    }
+    if (req.method === 'POST' && pathname === '/api/alipay/notify') {
+      return handleAlipayNotify(req, env);
     }
     if (req.method === 'GET' && pathname.startsWith('/api/weread/sync/')) {
       return jsonResponse(req, env, 400, { status: 'failed', message: 'Cloudflare 版本为实时同步，不支持任务轮询接口' });

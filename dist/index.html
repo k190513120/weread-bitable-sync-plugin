@@ -7,8 +7,8 @@
   <title>微信读书同步插件</title>
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
-  <script type="module" crossorigin src="./assets/index.5e57cfe9.js"></script>
-  <link rel="stylesheet" href="./assets/index.66fa3114.css">
+  <script type="module" crossorigin src="./assets/index.198dd715.js"></script>
+  <link rel="stylesheet" href="./assets/index.f07c4780.css">
 </head>
 <body>
   <main class="main">
@@ -97,6 +97,25 @@
 
     <footer class="footer-info">© 2024 微信读书同步工具</footer>
   </main>
+
+  <!-- Alipay QR Code Modal -->
+  <div id="alipayQRModal" class="qr-modal-overlay" style="display: none;">
+    <div class="qr-modal">
+      <button id="alipayQRClose" class="qr-modal-close">&times;</button>
+      <div class="qr-modal-header">
+        <i class="fas fa-qrcode"></i>
+        <h3>支付宝扫码支付</h3>
+      </div>
+      <div class="qr-modal-body">
+        <img id="alipayQRImage" class="qr-code-image" alt="支付宝付款码" />
+        <p class="qr-modal-hint">请使用支付宝扫描二维码完成支付</p>
+        <div class="qr-modal-status">
+          <i class="fas fa-spinner fa-spin"></i>
+          <span>等待支付中...</span>
+        </div>
+      </div>
+    </div>
+  </div>
 
   
 </body>

@@ -8,6 +8,8 @@ WEREAD_MAX_SYNC_RECORDS = "200"
 WEREAD_STRICT_REAL_DATA = "true"
 STRIPE_PRODUCT_NAME = "微信读书同步多维表格"
 REQUIRE_ACTIVE_SUBSCRIPTION = "false"
+ALIPAY_AMOUNT = "99.00"
+ALIPAY_SUBJECT = "微信读书同步多维表格"
 
 [[kv_namespaces]]
 binding = "STRIPE_STATE"

@@ -15,7 +15,9 @@ const loginProviderBaseUrl = (process.env.WEREAD_LOGIN_PROVIDER_URL || '').trim(
 const maxSyncBooks = Number(process.env.WEREAD_MAX_SYNC_BOOKS || 2000);
 const defaultMaxRecords = Number(process.env.WEREAD_MAX_SYNC_RECORDS || 200);
 const preferRealData = String(process.env.WEREAD_PREFER_REAL_DATA || 'true') === 'true';
-const strictRealData = String(process.env.WEREAD_STRICT_REAL_DATA || 'true') === 'true';
+const strictRealData = process.env.WEREAD_STRICT_REAL_DATA !== undefined
+  ? String(process.env.WEREAD_STRICT_REAL_DATA) === 'true'
+  : process.env.NODE_ENV === 'production';
 const cookieCloudUrl = (process.env.CC_URL || '').trim().replace(/\/+$/, '');
 const cookieCloudId = (process.env.CC_ID || '').trim();
 const cookieCloudPassword = (process.env.CC_PASSWORD || '').trim();
@@ -305,38 +307,105 @@ async function fetchChapterMap(bookId, wereadCookie) {
 }
 
 async function fetchBookmarks(bookId, wereadCookie) {
-  const url = `${WEREAD_BOOKMARK_LIST_URL}?bookId=${encodeURIComponent(bookId)}`;
-  const payload = await wereadRequestJson(url, { method: 'GET' }, wereadCookie);
-  return asArray(payload?.updated);
+  const pageSize = 100;
+  const maxPages = 20;
+  const records = [];
+  const seen = new Set();
+  let maxIdx = '0';
+  let syncKey = '0';
+
+  for (let page = 0; page < maxPages; page += 1) {
+    const params = new URLSearchParams({
+      bookId: String(bookId),
+      maxIdx,
+      count: String(pageSize),
+      syncKey
+    });
+    const payload = await wereadRequestJson(`${WEREAD_BOOKMARK_LIST_URL}?${params.toString()}`, { method: 'GET' }, wereadCookie);
+    const list = asArray(payload?.updated);
+    if (!list.length) break;
+
+    for (const item of list) {
+      const dedupeKey = String(item?.bookmarkId || item?.markId || `${item?.chapterUid || ''}-${item?.markTime || ''}`);
+      if (dedupeKey && seen.has(dedupeKey)) continue;
+      if (dedupeKey) seen.add(dedupeKey);
+      records.push(item);
+    }
+
+    const nextMaxIdx = String(payload?.nextMaxIdx ?? payload?.maxIdx ?? '');
+    const nextSyncKey = String(payload?.syncKey ?? payload?.synckey ?? '');
+    const hasMore = payload?.hasMore === true || payload?.continueFlag === 1 || payload?.isFinished === 0;
+    const cursorChanged = (nextMaxIdx && nextMaxIdx !== maxIdx) || (nextSyncKey && nextSyncKey !== syncKey);
+    if (!hasMore && !cursorChanged) break;
+    if (!cursorChanged && list.length < pageSize) break;
+    if (nextMaxIdx) maxIdx = nextMaxIdx;
+    if (nextSyncKey) syncKey = nextSyncKey;
+  }
+
+  return records;
 }
 
 async function fetchReviews(bookId, wereadCookie) {
-  const params = new URLSearchParams({
-    bookId: String(bookId),
-    listType: '4',
-    maxIdx: '0',
-    count: '50',
-    listMode: '2',
-    syncKey: '0'
-  });
-  const payload = await wereadRequestJson(`${WEREAD_REVIEW_LIST_URL}?${params.toString()}`, { method: 'GET' }, wereadCookie);
-  return asArray(payload?.reviews)
-    .map((item) => item?.review || item || null)
-    .filter(Boolean)
+  const pageSize = 100;
+  const maxPages = 20;
+  const reviews = [];
+  const seen = new Set();
+  let maxIdx = '0';
+  let syncKey = '0';
+
+  for (let page = 0; page < maxPages; page += 1) {
+    const params = new URLSearchParams({
+      bookId: String(bookId),
+      listType: '4',
+      maxIdx,
+      count: String(pageSize),
+      listMode: '2',
+      syncKey
+    });
+    const payload = await wereadRequestJson(`${WEREAD_REVIEW_LIST_URL}?${params.toString()}`, { method: 'GET' }, wereadCookie);
+    const list = asArray(payload?.reviews);
+    if (!list.length) break;
+
+    for (const item of list) {
+      const review = item?.review || item || null;
+      if (!review) continue;
+      const dedupeKey = String(review?.reviewId || review?.bookmarkId || '');
+      if (dedupeKey && seen.has(dedupeKey)) continue;
+      if (dedupeKey) seen.add(dedupeKey);
+      reviews.push(review);
+    }
+
+    const nextMaxIdx = String(payload?.nextMaxIdx ?? payload?.maxIdx ?? '');
+    const nextSyncKey = String(payload?.syncKey ?? payload?.synckey ?? '');
+    const hasMore = payload?.hasMore === true || payload?.continueFlag === 1 || payload?.isFinished === 0;
+    const cursorChanged = (nextMaxIdx && nextMaxIdx !== maxIdx) || (nextSyncKey && nextSyncKey !== syncKey);
+    if (!hasMore && !cursorChanged) break;
+    if (!cursorChanged && list.length < pageSize) break;
+    if (nextMaxIdx) maxIdx = nextMaxIdx;
+    if (nextSyncKey) syncKey = nextSyncKey;
+  }
+
+  return reviews
     .map((review) => ({
-      markText: String(review?.content || review?.abstract || ''),
-      abstract: String(review?.abstract || ''),
+      markText: String(review?.abstract || ''),
+      noteText: String(review?.content || ''),
       reviewId: String(review?.reviewId || ''),
       createTime: review?.createTime,
       chapterUid: Number(review?.type) === 4 ? 1000000 : review?.chapterUid
     }))
-    .filter((x) => x.markText);
+    .filter((x) => x.markText || x.noteText);
 }
 
 function normalizeMaxBooks(value, fallback = maxSyncBooks) {
   const n = Number(value);
   if (!Number.isFinite(n)) return fallback;
   return Math.max(1, Math.min(2000, Math.floor(n)));
+}
+
+function normalizeMaxRecords(value, fallback = defaultMaxRecords) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(1, Math.min(500000, Math.floor(n)));
 }
 
 async function fetchNotebooks(wereadCookie, maxBooksLimit = maxSyncBooks) {
@@ -346,9 +415,10 @@ async function fetchNotebooks(wereadCookie, maxBooksLimit = maxSyncBooks) {
 }
 
 async function fetchHighlightsByWereadCookie(wereadCookie, maxRecords = defaultMaxRecords, maxBooksLimit = maxSyncBooks) {
-  if (!wereadCookie) return [];
+  if (!wereadCookie) return { highlights: [], books: [] };
   const books = await fetchNotebooks(wereadCookie, maxBooksLimit);
   const highlights = [];
+  const booksMeta = [];
 
   for (const item of books) {
     if (highlights.length >= maxRecords) break;
@@ -359,6 +429,7 @@ async function fetchHighlightsByWereadCookie(wereadCookie, maxRecords = defaultM
     const bookTitle = String(book?.title || '');
     const author = String(book?.author || '');
     const tags = asArray(book?.categories).map((x) => String(x?.title || '')).filter(Boolean).join('、');
+    booksMeta.push(item);
 
     let chapterMap = {};
     try {
@@ -370,20 +441,36 @@ async function fetchHighlightsByWereadCookie(wereadCookie, maxRecords = defaultM
     try {
       const bookmarks = await fetchBookmarks(bookId, wereadCookie);
       const reviews = await fetchReviews(bookId, wereadCookie);
-      const merged = [...bookmarks, ...reviews];
-      for (const row of merged) {
+      for (const row of bookmarks) {
         const chapter = chapterMap[String(row?.chapterUid)] || '';
         const mapped = normalizeHighlight({
           bookTitle,
           author,
           chapter,
           highlightText: row?.markText || row?.text || row?.highlightText,
-          noteText: row?.abstract || '',
+          noteText: '',
           tags,
-          highlightId: row?.reviewId || row?.bookmarkId || row?.markId || '',
+          highlightId: row?.bookmarkId || row?.markId || '',
           bookId,
           highlightedAt: row?.createTime || row?.markTime,
           updatedAt: row?.updateTime || row?.createTime
+        });
+        if (mapped) highlights.push(mapped);
+        if (highlights.length >= maxRecords) break;
+      }
+      for (const row of reviews) {
+        const chapter = chapterMap[String(row?.chapterUid)] || '';
+        const mapped = normalizeHighlight({
+          bookTitle,
+          author,
+          chapter,
+          highlightText: row?.markText || '',
+          noteText: row?.noteText || '',
+          tags,
+          highlightId: row?.reviewId || '',
+          bookId,
+          highlightedAt: row?.createTime,
+          updatedAt: row?.createTime
         });
         if (mapped) highlights.push(mapped);
         if (highlights.length >= maxRecords) break;
@@ -393,14 +480,17 @@ async function fetchHighlightsByWereadCookie(wereadCookie, maxRecords = defaultM
     }
   }
 
-  return highlights.slice(0, maxRecords);
+  return {
+    highlights: highlights.slice(0, maxRecords),
+    books: booksMeta
+  };
 }
 
-async function fetchHighlightsForSession(session) {
+async function fetchSyncPayloadForSession(session) {
   if (preferRealData && session?.wereadCookie) {
     try {
       const realData = await fetchHighlightsByWereadCookie(session.wereadCookie, session?.maxRecords, session?.maxBooks);
-      if (realData.length) {
+      if (asArray(realData?.highlights).length) {
         return realData;
       }
       if (strictRealData) {
@@ -421,9 +511,15 @@ async function fetchHighlightsForSession(session) {
     }
     const result = await response.json();
     const list = asArray(result?.highlights ?? result);
-    return list.map(normalizeHighlight).filter(Boolean);
+    return {
+      highlights: list.map(normalizeHighlight).filter(Boolean),
+      books: asArray(result?.books)
+    };
   }
-  return loadSampleHighlights();
+  return {
+    highlights: await loadSampleHighlights(),
+    books: []
+  };
 }
 
 function ensureSession(sessionId) {
@@ -581,7 +677,7 @@ app.post('/api/weread/sync', async (req, res) => {
   const sessionId = String(req.body?.sessionId || '').trim();
   const directCookie = String(req.body?.wereadCookie || req.body?.cookie || '').trim();
   const requestMaxBooks = normalizeMaxBooks(req.body?.maxBooks, maxSyncBooks);
-  const requestMaxRecords = normalizeMaxBooks(req.body?.maxRecords, defaultMaxRecords);
+  const requestMaxRecords = normalizeMaxRecords(req.body?.maxRecords, defaultMaxRecords);
   let session = null;
 
   if (sessionId) {
@@ -645,16 +741,17 @@ app.post('/api/weread/sync', async (req, res) => {
   }
 
   const jobId = uuidv4();
-  jobs.set(jobId, { jobId, status: 'processing', createdAt: now(), highlights: [] });
+  jobs.set(jobId, { jobId, status: 'processing', createdAt: now(), highlights: [], books: [] });
   res.json({ status: 'processing', jobId });
 
   setTimeout(async () => {
     const job = jobs.get(jobId);
     if (!job) return;
     try {
-      const highlights = await fetchHighlightsForSession(session);
+      const syncPayload = await fetchSyncPayloadForSession(session);
       job.status = 'completed';
-      job.highlights = highlights;
+      job.highlights = asArray(syncPayload?.highlights);
+      job.books = asArray(syncPayload?.books);
       job.finishedAt = now();
     } catch (error) {
       job.status = 'failed';
@@ -674,7 +771,8 @@ app.get('/api/weread/sync/:jobId', (req, res) => {
   }
   return res.json({
     status: job.status,
-    highlights: job.status === 'completed' ? job.highlights : undefined
+    highlights: job.status === 'completed' ? job.highlights : undefined,
+    books: job.status === 'completed' ? job.books : undefined
   });
 });
 

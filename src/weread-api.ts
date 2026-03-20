@@ -28,12 +28,33 @@ export interface WereadHighlight {
   updatedAt?: number;
 }
 
+export interface WereadBookMeta {
+  bookId: string;
+  bookTitle: string;
+  author: string;
+  tags: string;
+  categoryTitles: string;
+  cover: string;
+  price?: number;
+  intro: string;
+  publisher: string;
+  version: string;
+  format: string;
+  publishTime?: number;
+  updateTime?: number;
+  wordCount?: number;
+  rawMetaJson: string;
+}
+
 export interface WereadSyncResponse {
   status?: 'processing' | 'completed' | 'payment_required';
   jobId?: string;
   highlights?: unknown[];
+  books?: unknown[];
   message?: string;
   checkoutUrl?: string;
+  qrCode?: string;
+  outTradeNo?: string;
 }
 
 function buildUrl(baseUrl: string, path: string): string {
@@ -99,12 +120,13 @@ export async function startWereadSync(
   apiKey?: string,
   wereadCookie?: string,
   maxRecords?: number,
-  userId?: string
+  userId?: string,
+  paymentMethod?: string
 ): Promise<WereadSyncResponse> {
   return requestJson<WereadSyncResponse>(buildUrl(baseUrl, '/api/weread/sync'), {
     method: 'POST',
     headers: buildHeaders(apiKey),
-    body: JSON.stringify({ sessionId, wereadCookie, maxRecords, userId })
+    body: JSON.stringify({ sessionId, wereadCookie, maxRecords, userId, paymentMethod })
   });
 }
 
@@ -193,4 +215,47 @@ export function normalizeWereadHighlights(input: unknown[] | undefined): WereadH
       return mapped;
     })
     .filter((item): item is WereadHighlight => Boolean(item));
+}
+
+export function normalizeWereadBooks(input: unknown[] | undefined): WereadBookMeta[] {
+  if (!Array.isArray(input)) {
+    return [];
+  }
+
+  return input
+    .map((item) => {
+      if (!item || typeof item !== 'object') return null;
+      const raw = item as Record<string, unknown>;
+      const book = (raw.book && typeof raw.book === 'object' ? raw.book : raw) as Record<string, unknown>;
+      const categories = Array.isArray(book.categories) ? book.categories : [];
+      const tags = categories.map((x) => String((x as Record<string, unknown>)?.title || '')).filter(Boolean).join('、');
+      const publishTime = asTimestamp(book.publishTime ?? book.publish_time);
+      const updateTime = asTimestamp(book.updateTime ?? book.update_time);
+      const wordCountRaw = book.wordCount ?? book.word_count;
+      const wordCount = typeof wordCountRaw === 'number' ? wordCountRaw : Number(wordCountRaw || 0) || undefined;
+      const priceRaw = book.price;
+      const centPriceRaw = book.centPrice ?? book.cent_price;
+      const priceFromCent = Number(centPriceRaw || 0);
+      const price = typeof priceRaw === 'number' ? priceRaw : Number(priceRaw || 0) || (priceFromCent > 0 ? priceFromCent / 100 : undefined);
+      const mapped: WereadBookMeta = {
+        bookId: pickString(book, ['bookId', 'book_id']),
+        bookTitle: pickString(book, ['title', 'bookTitle', 'book_name', 'bookName']),
+        author: pickString(book, ['author', 'bookAuthor']),
+        tags,
+        categoryTitles: tags,
+        cover: pickString(book, ['cover', 'coverUrl', 'cover_url']),
+        price,
+        intro: pickString(book, ['intro', 'introduction', 'summary']),
+        publisher: pickString(book, ['publisher']),
+        version: pickString(book, ['version']),
+        format: pickString(book, ['format']),
+        publishTime,
+        updateTime,
+        wordCount,
+        rawMetaJson: JSON.stringify(raw)
+      };
+      if (!mapped.bookId && !mapped.bookTitle) return null;
+      return mapped;
+    })
+    .filter((item): item is WereadBookMeta => Boolean(item));
 }
