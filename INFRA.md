@@ -55,7 +55,7 @@
 | Webhook URL | `https://wereadsync.xiaomiao.win/api/stripe/webhook` |
 | 订阅事件 | `checkout.session.completed`, `customer.subscription.*` |
 
-> ⚠️ Stripe 后台还有一条 `we_1T9jYH...` 的 endpoint，URL 字段被错填成 `weread-sync-service.kelan656691.workers.dev/api/stripe/webhookhttps://...`（host 重复），404 一直发不出去。**应当修正为 `https://wereadsync.xiaomiao.win/api/stripe/webhook`，或与 `we_1TCCv9...`（同样指 wereadsync.xiaomiao.win 的旧 email endpoint）合并**。
+> 2026-05-13 已修正：`we_1T9jYH...` 的 URL 之前是 `weread-sync-service.kelan656691.workers.dev/api/stripe/webhookhttps://...`（host 写了两遍，404），现在已改成 `https://wereadsync.xiaomiao.win/api/stripe/webhook`。同时另一条 `we_1TCCv9...`（指 wereadsync 的旧 email endpoint）已 disabled。
 
 ---
 
@@ -84,6 +84,7 @@
 
 ## 改动记录
 
+- 2026-05-13: Stripe webhook `we_1T9jYH...` URL 修正为 `https://wereadsync.xiaomiao.win/api/stripe/webhook`（之前 host 拼了两遍）；`we_1TCCv9...` 禁用（无主签名 secret，永远 400）。
 - 2026-05-13: main 收纳 `chore/add-deploy-ci` 分支两个 commit（CI 自动部署 + 绑定 `wereadsync.xiaomiao.win` 自定义域）；新建本文档。
 - 2026-05-11: `wereadsync.xiaomiao.win` 域名从 email worker 归还给 weread worker（之前 email 插件临时借用了这个域名）；新 deployment id `1f27a49d`（CI 触发的）。
 - 历史: weread 是本仓库系列里第一个接 Alipay 当面付的插件，后续 email / db 都从这里 copy-paste 了相同的 RSA2 签名与 precreate / query / notify 路径。
