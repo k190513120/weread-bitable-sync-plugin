@@ -2,6 +2,10 @@ name = "weread-sync-service"
 main = "cloudflare/worker.js"
 compatibility_date = "2026-03-11"
 
+routes = [
+  { pattern = "wereadsync.xiaomiao.win", custom_domain = true }
+]
+
 [vars]
 WEREAD_MAX_SYNC_BOOKS = "2000"
 WEREAD_MAX_SYNC_RECORDS = "200"
